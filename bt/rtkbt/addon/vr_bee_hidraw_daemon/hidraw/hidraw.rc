@@ -1,0 +1,4 @@
+service hidraw /vendor/bin/vr_bee_hidraw_daemon
+    class main
+    user root
+    group root

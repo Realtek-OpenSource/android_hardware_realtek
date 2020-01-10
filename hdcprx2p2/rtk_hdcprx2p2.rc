@@ -1,0 +1,5 @@
+service rtk_hdcprx2p2 /vendor/bin/rtk_hdcprx2p2
+    class delay_start
+    user system
+    group system
+    oneshot

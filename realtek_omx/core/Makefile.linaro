@@ -1,0 +1,71 @@
+PLATFORM_LIB_SRC_PATH=../../../..
+GENERIC_LINUX_PATH=$(PLATFORM_LIB_SRC_PATH)/genericLinux
+include $(GENERIC_LINUX_PATH)/MakeConfig
+
+MYDEFS=-DHAVE_SYS_UIO_H
+rm=/bin/rm -f
+cp=/bin/cp -f
+CC= $(MYCC)
+CXX = $(MYCXX)
+AR= $(MYAR) cq
+RANLIB= $(MYRANLIB)
+LIBNAME= $(GENERIC_LINUX_PATH)/lib/libOMX_Core.so
+
+TOP=$(PLATFORM_LIB_SRC_PATH)
+LOCAL_PATH=.
+
+USE_ION = yes
+
+RTK_TOP := $(TOP)/hardware/realtek/realtek_omx
+RTK_INC := $(RTK_TOP)/include
+RTK_RPC := $(TOP)/device/realtek/proprietary/libs/rtk_libs/common
+RTK_PLI := $(TOP)/device/realtek/proprietary/libs/rtk_libs/OSAL
+
+LOCAL_SRC_FILES := RTK_OMX_Core.c
+
+LOCAL_CFLAGS := $(PV_CFLAGS_MINUS_VISIBILITY)
+
+LOCAL_C_INCLUDES := \
+	$(RTK_INC)/rtkext \
+	$(RTK_RPC)/include \
+	$(RTK_RPC)/IPC/include \
+	$(RTK_RPC)/IPC/generate/include \
+	$(RTK_RPC)/IPC/generate/include/system \
+	$(RTK_PLI)/include \
+	$(GENERIC_LINUX_PATH)/include \
+	$(GENERIC_LINUX_PATH)/include/openmax
+
+OBJ_FILES = $(addsuffix .o, $(basename $(LOCAL_SRC_FILES)))
+
+INCLUDES = $(addprefix -I, $(LOCAL_C_INCLUDES))
+
+CFLAGS = $(INCLUDES) $(DEFINES) $(LOCAL_CFLAGS) -DSYS_UNIX=1 $(MYDEFS) -fPIC
+
+LOCAL_SHARED_LIBRARIES = \
+	-Wl,--whole-archive \
+	$(GENERIC_LINUX_PATH)/lib/libRTK_lib.a \
+	$(GENERIC_LINUX_PATH)/lib/libhwse_$(TARGET_BOARD_PLATFORM).a \
+	$(GENERIC_LINUX_PATH)/lib/libgeneric_misc.a \
+	-Wl,--no-whole-archive
+
+all: $(LIBNAME)
+
+$(LIBNAME) : $(OBJ_FILES)
+	$(SHOW_COMMAND)$(rm) $@
+	$(SHOW_COMMAND)$(AR) $@ $(OBJ_FILES)
+	$(CC) -shared $(LOCAL_SHARED_LIBRARIES) -o $@ $(OBJ_FILES)
+
+clean:
+	$(SHOW_COMMAND)$(rm) $(OBJ_FILES) $(LIBNAME) core *~
+
+miniclean: clean
+
+.cpp.o:
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo -=--=--=- [$*.cpp] -=--=--=--=--=--=--=--=--=-
+	$(SHOW_COMMAND)$(CXX) $(CFLAGS) $(WARNING) $(DEBUGFLAG) -c $*.cpp -o $@
+
+.c.o:
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo --------- [$*.c] ---------------------------
+	$(SHOW_COMMAND)$(CC) $(CFLAGS) $(WARNING) $(DEBUGFLAG) -c $*.c -o $@

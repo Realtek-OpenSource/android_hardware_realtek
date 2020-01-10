@@ -1,0 +1,5 @@
+service vendor.usb-hal-1-1 /vendor/bin/hw/android.hardware.usb@1.1-service.rtk
+    class hal
+    user system
+    group system
+

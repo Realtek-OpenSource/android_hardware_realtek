@@ -1,0 +1,6 @@
+# add from Realtek_Wi-Fi_SDK_for_Android_L_5_0.pdf
+service rtw_fwloader /system/bin/rtw_fwloader
+    class main
+    disabled
+    oneshot
+
