@@ -1,0 +1,175 @@
+PLATFORM_LIB_SRC_PATH=../../../../../..
+GENERIC_LINUX_PATH=$(PLATFORM_LIB_SRC_PATH)/genericLinux
+include $(GENERIC_LINUX_PATH)/MakeConfig
+
+MYDEFS=-DHAVE_SYS_UIO_H
+rm=/bin/rm -f
+cp=/bin/cp -f
+CC= $(MYCC)
+CXX = $(MYCXX)
+AR= $(MYAR) cq
+RANLIB= $(MYRANLIB)
+LIBNAME= $(GENERIC_LINUX_PATH)/lib/libOMX.realtek.audio.dec.so
+
+TOP=$(PLATFORM_LIB_SRC_PATH)
+LOCAL_PATH=.
+
+USE_ION = yes
+
+RTK_TOP := $(TOP)/hardware/realtek/realtek_omx
+RTK_INC := $(RTK_TOP)/include
+RTK_RPC := $(TOP)/device/realtek/proprietary/libs/rtk_libs/common
+RTK_PLI := $(TOP)/device/realtek/proprietary/libs/rtk_libs/OSAL
+
+LOCAL_SRC_FILES := \
+	decoder.c \
+	codec_rtk.c \
+	AAC_Utility.c
+
+
+ifeq ($(ENABLE_MS12), Y)
+OMX_AUDIO_CFG = OMX_AUDIO_CFG_2
+
+LOCAL_PRELINK_MODULE := false
+AUDIO_ON_SCPU_EN = true
+AUDIO_DWNSTRM_INBAND_QUEUE_EN = false
+AUDIO_RAWOUTINFO_INBAND_QUEUE_EN = false
+SUPPORT_MS12_FLOW = false
+AUDIO_ON_SCPU_MS12_EN = false
+NEW_CHANNEL_INDEX_TYPE_EN = true
+MS12_SWITCH_FILE_EN = false
+
+ifeq ($(OMX_AUDIO_CFG), OMX_AUDIO_CFG_2)
+AUDIO_DWNSTRM_INBAND_QUEUE_EN = true
+SUPPORT_MS12_FLOW = true
+AUDIO_ON_SCPU_MS12_EN = true
+endif
+
+ifeq ($(OMX_AUDIO_CFG), OMX_AUDIO_CFG_3)
+#AUDIO_ON_SCPU_EN = true
+AUDIO_DWNSTRM_INBAND_QUEUE_EN = true
+AUDIO_RAWOUTINFO_INBAND_QUEUE_EN = true
+AUDIO_ON_SCPU_MS12_EN = true
+LOCAL_CFLAGS += -DUDC_PLAYER_EN
+LOCAL_SRC_FILES += codec_rtk_ms12.c decoder_ms12.c codec_ms12_gbl_var.c codec_rtk_ms12_filewrite.c
+endif
+
+ifeq ($(OMX_AUDIO_CFG), OMX_AUDIO_CFG_4)
+AUDIO_DWNSTRM_INBAND_QUEUE_EN = true
+AUDIO_RAWOUTINFO_INBAND_QUEUE_EN = true
+AUDIO_ON_SCPU_EN = true
+endif
+
+ifeq ($(MS12_SWITCH_FILE_EN),true)
+LOCAL_CFLAGS += -DMS12_SWITCH_FILE_ENABLED
+LOCAL_SRC_FILES += ms12_switch_file.c
+endif
+
+ifeq ($(AUDIO_DWNSTRM_INBAND_QUEUE_EN),true)
+LOCAL_CFLAGS += -DMS12_DEC_PTSQ_TO_PP
+endif
+
+ifeq ($(AUDIO_RAWOUTINFO_INBAND_QUEUE_EN), true)
+LOCAL_CFLAGS += -DDEC_RAWOUTINFO_TO_PP
+endif
+
+ifeq ($(AUDIO_ON_SCPU_EN),true)
+LOCAL_CFLAGS += -DAUDIO_ON_SCPU
+LOCAL_SRC_FILES += fw_misc.c
+LOCAL_SHARED_LIBRARIES += -L$(GENERIC_LINUX_PATH)/lib $(GENERIC_LINUX_PATH)/lib/libRTK_lib.a
+endif
+
+ifeq ($(AUDIO_ON_SCPU_MS12_EN),true)
+LOCAL_CFLAGS += -DAUDIO_ON_SCPU_MS12
+LOCAL_CFLAGS += -DATMOS_DEMO
+LOCAL_SRC_FILES += fw_misc_ms12.c
+
+ifeq ($(AUDIO_ON_SCPU_EN),false)
+LOCAL_SRC_FILES += fw_misc.c
+LOCAL_SHARED_LIBRARIES += -L$(GENERIC_LINUX_PATH)/lib $(GENERIC_LINUX_PATH)/lib/libRTK_lib.a
+endif
+
+endif
+
+ifeq ($(SUPPORT_MS12_FLOW),true)
+LOCAL_CFLAGS += -DMS12_FLOW_EN
+LOCAL_CFLAGS += -DMS12_FUTURE_USE
+LOCAL_CFLAGS += -DMS12_SINGLE_PLAYER
+LOCAL_CFLAGS += -DMS12_FILE_WRITE_TEST
+LOCAL_CFLAGS += -DMS12_FILEWRITE_WITH_ENC
+LOCAL_CFLAGS += -DMS12_FILEWRITE_WITH_DD_CNVTR
+LOCAL_CFLAGS += -DMS12_CNVTR_RAWOUT_EN
+LOCAL_SRC_FILES += codec_rtk_ms12.c decoder_ms12.c codec_ms12_gbl_var.c codec_rtk_ms12_filewrite.c
+endif
+endif
+
+ifeq ($(USE_ION), yes)
+LOCAL_CFLAGS += -DENABLE_ION
+endif
+
+LOCAL_CFLAGS += -DOMX_DECODER_VIDEO_DOMAIN -DUSE_OUTPUT_CROP
+LOCAL_CFLAGS += -DUSE_RT_ION
+
+LOCAL_C_INCLUDES := \
+	. \
+	$(RTK_INC)/rtkext \
+	$(RTK_INC)/imagination \
+	$(TOP)/system/core/include \
+	$(TOP)/system/core/include/cutils \
+	$(TOP)/system/core/include/ion \
+	$(TOP)/system/media/audio_utils/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_ion \
+	$(TOP)/bionic/libc/kernel/common \
+	$(TOP)/hardware/libhardware/include \
+	$(RTK_RPC)/IPC/include \
+	$(RTK_RPC)/IPC/generate/include/system \
+	$(RTK_TOP)/osal_rtk \
+	$(RTK_TOP)/core \
+	$(TOP)/hardware/realtek/StreamingEngine2 \
+	$(GENERIC_LINUX_PATH)/include \
+	$(GENERIC_LINUX_PATH)/include/openmax \
+	$(PLATFORM_LIB_SRC_PATH)/device/realtek/firmware/include
+
+LOCAL_C_INCLUDES += $(TOP)/device/realtek/proprietary/libs/Include
+LOCAL_C_INCLUDES += $(TOP)/device/realtek/proprietary/libs/libRTKAllocator/include
+
+ifeq ($(ENABLE_MS12), Y)
+LOCAL_C_INCLUDES += \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/common/fw_socket/ \
+	$(PLATFORM_LIB_SRC_PATH)/device/realtek/firmware/include
+endif
+
+LIBS += -lpthread
+
+OBJ_FILES = $(addsuffix .o, $(basename $(LOCAL_SRC_FILES)))
+
+INCLUDES = $(addprefix -I, $(LOCAL_C_INCLUDES))
+
+CFLAGS = $(INCLUDES) $(DEFINES) $(LOCAL_CFLAGS) -DSYS_UNIX=1 $(MYDEFS) -fPIC -pthread
+
+LOCAL_SHARED_LIBRARIES += \
+	-Wl,--whole-archive \
+	$(GENERIC_LINUX_PATH)/lib/libRTKAllocator.a \
+	-Wl,--no-whole-archive
+
+all: $(LIBNAME)
+
+$(LIBNAME) : $(OBJ_FILES)
+	$(SHOW_COMMAND)$(rm) $@
+	$(SHOW_COMMAND)$(AR) $@ $(OBJ_FILES)
+	$(CC) -shared -o $@ $(OBJ_FILES) $(LOCAL_SHARED_LIBRARIES)
+
+clean:
+	$(SHOW_COMMAND)$(rm) $(OBJ_FILES) $(LIBNAME) core *~
+
+miniclean: clean
+
+.cpp.o:
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo -=--=--=- [$*.cpp] -=--=--=--=--=--=--=--=--=-
+	$(SHOW_COMMAND)$(CXX) $(CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.cpp -o $@
+
+.c.o:
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo --------- [$*.c] ---------------------------
+	$(SHOW_COMMAND)$(CC) $(CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.c -o $@

@@ -1,0 +1,18 @@
+#ifndef MJPG_FMT_H
+#define MJPG_FMT_H
+
+#define FMT_NV21 (0)
+
+#if (FMT_NV21)
+
+#define MJPG_HAL_FMT        HAL_PIXEL_FORMAT_RTK_W16_H16_YCrCb_420_SP
+#define JPEG_ENCODER_FMT    HAL_PIXEL_FORMAT_YCrCb_420_SP
+
+#else
+
+#define MJPG_HAL_FMT        HAL_PIXEL_FORMAT_RTK_W16_H16_YCbCr_420_SP
+#define JPEG_ENCODER_FMT    HAL_PIXEL_FORMAT_RTK_16_YCbCr_420_SP
+
+#endif
+
+#endif

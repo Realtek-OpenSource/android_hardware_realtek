@@ -1,0 +1,1584 @@
+/******************************************************************************
+ *
+ *  Copyright (C) 2009-2012 Realtek Corporation
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at:
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+/*****************************************************************************
+ *
+ *  Filename:      audio_sco_hw.c
+ *
+ *  Description:   Implements hal for bluedroid sco audio device
+ *
+ *****************************************************************************/
+#define LOG_TAG "audio_sco_default"
+#define LOG_NDEBUG 0
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <cutils/log.h>
+#include <hardware/hardware.h>
+#include <system/audio.h>
+#include <hardware/audio.h>
+#include <cutils/log.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/poll.h>
+#include <sys/errno.h>
+#include <cutils/str_parms.h>
+#include <cutils/sockets.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <tinyalsa/asoundlib.h>
+
+#include <audio_utils/resampler.h>
+#include <audio_utils/echo_reference.h>
+#include <audio_utils/channels.h>
+
+//#define STREAM_DUMP_DEBUG
+
+#include "audio_sco_hw.h"
+
+/*****************************************************************************
+**  Constants & Macros
+******************************************************************************/
+#define FNLOG()             ALOGD("%s", __FUNCTION__);
+#define DEBUG(fmt, ...)     ALOGD("%s: " fmt,__FUNCTION__, ## __VA_ARGS__)
+#define INFO(fmt, ...)      ALOGI("%s: " fmt,__FUNCTION__, ## __VA_ARGS__)
+#define ERROR(fmt, ...)     ALOGE("%s: " fmt,__FUNCTION__, ## __VA_ARGS__)
+#define UNUSED(x)           (void)(x)
+
+#define SNDBUFSIZE	(5 * SCO_OUT_BUFSIZE)
+#define RCVBUFSIZE	(5 * SCO_IN_BUFSIZE)
+
+#define USEC_PER_SEC 1000000L
+
+#ifdef STREAM_DUMP_DEBUG
+#define RECORDER_PCM_LOC "/data/misc/media/record_debug.pcm"
+#define PLAYBACK_PCM_LOC "/data/misc/media/playback_debug.pcm"
+#endif
+
+/*****************************************************************************
+**  Local type definitions
+******************************************************************************/
+struct sco_config {
+    uint32_t                samplerate;
+    uint32_t                channel_flags;
+    int                     format;
+};
+
+struct sco_stream_out {
+    struct audio_stream_out stream;
+    struct sco_audio_device *dev;
+    struct timeval base,ts;
+    struct sco_config      cfg;
+    int outfd;
+    struct pcm *pcm_playback;
+    struct resampler_itfe *resampler;
+    pthread_mutex_t lock;
+
+    uint64_t last_frame_us;
+};
+
+struct sco_stream_in {
+    struct audio_stream_in stream;
+    struct sco_audio_device *dev;
+    struct timeval base,ts;
+    struct sco_config      cfg;
+    int infd;
+    struct pcm *pcm_capture;
+    struct resampler_itfe *resampler;
+    pthread_mutex_t lock;
+
+    uint64_t last_frame_us;
+};
+
+struct sco_audio_device {
+    struct audio_hw_device device;
+    struct sco_stream_out *output;
+    struct sco_stream_in *input;
+    pthread_mutex_t         lock;
+    int ctrlfd;
+    int datafd;
+    bool wbs;
+    int alsa_card;
+};
+
+
+/*****************************************************************************
+**  Static variables
+******************************************************************************/
+#ifdef STREAM_DUMP_DEBUG
+static int debug_record_fd              = 0;
+static int debug_playback_fd            = 0;
+#endif
+
+/*****************************************************************************
+**  Static functions
+******************************************************************************/
+
+#if 0
+ /* for auto detect ALSA card */
+static void detect_alsa_card_number(struct sco_audio_device *adev)
+{
+    const char* cards = "/proc/asound/cards";
+    int tries = 10;
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t bytes_read;
+    int line_no = 0;
+    char *ptr, *saveptr;
+    FILE *fp;
+    int card_number = -1;
+
+    DEBUG("Start detect alsa cards\n");
+
+    while (--tries) {
+        if ((fp = fopen(cards, "r")) == NULL) {
+            ALOGE("Cannot open %s file to get list of sound cards", cards);
+            usleep(10000);
+            continue;
+        }
+        break;
+    }
+
+    if(fp != NULL)
+    {
+        while ((bytes_read = getline(&line, &len, fp) != -1)) {
+            ERROR("Line %d:%s", line_no, line);
+
+        if (line_no++ % 2)
+            continue;
+
+        ptr = strtok_r(line, " [", &saveptr);
+        if (!ptr) {
+            continue;
+        }
+
+        card_number = atoi(ptr);
+
+        DEBUG("token1 %s:%d", ptr, card_number);
+
+        ptr = strtok_r(saveptr, " [", &saveptr);
+        if (!ptr) {
+            continue;
+        }
+
+        DEBUG("token2 %s:%d", ptr, card_number);
+
+        if (!strncmp(ptr, "sndscortk", 9))
+        {
+            adev->alsa_card = card_number;
+            DEBUG("find alsa card number %d", adev->alsa_card);
+            break;
+        }
+    }
+
+    DEBUG("End detect alsa cards\n");
+
+    if (line)
+        free(line);
+
+        fclose(fp);
+    }
+}
+
+#endif
+
+static uint64_t time_now_us()
+{
+    struct timespec ts_now;
+    clock_gettime(CLOCK_BOOTTIME, &ts_now);
+    return ((uint64_t)ts_now.tv_sec * USEC_PER_SEC) + ((uint64_t)ts_now.tv_nsec / 1000);
+}
+
+#ifdef STREAM_DUMP_DEBUG
+static void debug_pcm_data_open(int *pfd, bool is_playback)
+{
+    ALOGD("%s: is_playback %d", __FUNCTION__, is_playback);
+
+    *pfd = (is_playback) ? (open(PLAYBACK_PCM_LOC, O_WRONLY | O_CREAT | O_TRUNC,
+                S_IRUSR | S_IWUSR | S_IRGRP)) : (open(RECORDER_PCM_LOC, O_WRONLY | O_CREAT | O_TRUNC,
+                    S_IRUSR | S_IWUSR | S_IRGRP));
+
+    if (*pfd < 0) {
+        ALOGE("%s: Cannot open file[%s], %s", __FUNCTION__, is_playback ? PLAYBACK_PCM_LOC:
+                RECORDER_PCM_LOC, strerror(errno));
+        return;
+    }
+}
+
+static void debug_pcm_data_write(int pfd, const void* buffer, size_t bytes)
+{
+    if (pfd != 0) {
+        write(pfd , buffer, bytes);
+    }
+}
+
+static void debug_pcm_data_close(int *pfd)
+{
+    ALOGD("%s", __FUNCTION__);
+    close(*pfd);
+    *pfd = 0;
+}
+#endif      /*STREAM_DUMP_DEBUG */
+
+
+/*****************************************************************************
+**  Externs
+******************************************************************************/
+
+
+
+/*****************************************************************************
+**  Functions
+******************************************************************************/
+
+
+
+/*****************************************************************************
+**   Miscellaneous helper functions
+******************************************************************************/
+static int skt_connect(char *path, int sndbufsize, int rcvbufsize, int sndto, int rcvto)
+{
+    int ret;
+    int skt_fd;
+#if 0
+    struct sockaddr_un remote;
+    socklen_t alen;
+#endif
+    int val;
+    struct timeval tv;
+
+    DEBUG("connect to %s (sz %d)", path, sndbufsize);
+
+    skt_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+#if 1
+    if(socket_local_client_connect(skt_fd, path,
+                ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_STREAM) < 0)
+    {
+        DEBUG("failed to connect (%s)", strerror(errno));
+        close(skt_fd);
+        return -1;
+    }
+#else
+    memset(&remote, 0, sizeof(remote));
+    strcpy(remote.sun_path, path);
+    remote.sun_family = AF_UNIX;
+    remote.sun_path[0] = 0;
+    alen = strlen(remote.sun_path) + offsetof(struct sockaddr_un, sun_path);
+
+    if(connect(skt_fd, (struct sockaddr *)&remote, alen) < 0) {
+        DEBUG("failed to connect (%s)", strerror(errno));
+        close(skt_fd);
+        return -1;
+    }
+#endif
+
+    if(sndbufsize > 0)
+    {
+        val = sndbufsize;
+        ret = setsockopt(skt_fd, SOL_SOCKET, SO_SNDBUF, (char*)&val, (int)sizeof(val));
+        if (ret < 0)
+            DEBUG("setsockopt failed (%s)", strerror(errno));
+    }
+    if(rcvbufsize > 0)
+    {
+        val = rcvbufsize;
+        ret = setsockopt(skt_fd, SOL_SOCKET, SO_RCVBUF, (char*)&val, (int)sizeof(val));
+        if (ret < 0)
+            DEBUG("setsockopt failed (%s)", strerror(errno));
+    }
+    if(sndto > 0)
+    {
+        tv.tv_sec = sndto/1000000;
+        tv.tv_usec = sndto%1000000;
+        ret = setsockopt(skt_fd, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, (int)sizeof(tv));
+        if (ret < 0)
+            DEBUG("setsockopt failed (%s)", strerror(errno));
+    }
+    if(rcvto > 0)
+    {
+        tv.tv_sec = rcvto/1000000;
+        tv.tv_usec = rcvto%1000000;
+        ret = setsockopt(skt_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, (int)sizeof(tv));
+        if (ret < 0)
+            DEBUG("setsockopt failed (%s)", strerror(errno));
+    }
+
+    DEBUG("connected to %s fd = %d", path, skt_fd);
+
+    return skt_fd;
+}
+
+
+static int skt_disconnect(int fd)
+{
+    DEBUG("fd %d", fd);
+
+    if (fd > 0)
+    {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+    return 0;
+}
+
+#if 0
+static uint32_t sco_get_sample_rate(struct sco_audio_device * dev)
+{
+    UNUSED(dev);
+    uint8_t response[64];
+    int res;
+    uint32_t samplerate = SCO_SAMPLE_RATE_16K;
+    char cmd = SCO_CTRL_GET_AUDIO_CONFIG;
+    char ack = 0;
+
+    if(dev)
+    {
+        pthread_mutex_lock(&(dev->lock));
+        if(dev->ctrlfd <= 0)
+            dev->ctrlfd = skt_connect(SCO_CTRL_PATH, 0, 0, 0, 2000000);
+        if(dev->ctrlfd > 0)
+        {
+            memset(response,0,sizeof(response));
+            res = send(dev->ctrlfd, &cmd, 1, MSG_NOSIGNAL);
+            res = recv(dev->ctrlfd, &ack, 1, MSG_NOSIGNAL);
+            if(res > 0) {
+                if(ack == 2) {
+                    samplerate = SCO_SAMPLE_RATE_16K;
+                }
+            }
+        }
+        pthread_mutex_unlock(&(dev->lock));
+    }
+    DEBUG("response=%s samplerate=%d", response, samplerate);
+
+    return samplerate;
+}
+#endif
+
+static uint32_t out_get_sample_rate(const struct audio_stream *stream)
+{
+    struct sco_stream_out * out = (struct sco_stream_out *)stream;
+
+    if (out->cfg.samplerate == 0)
+        return SCO_SAMPLE_RATE_16K;
+
+    return out->cfg.samplerate;
+}
+
+static uint32_t out_get_cached_sample_rate(const struct audio_stream *stream)
+{
+    struct sco_stream_out * out = (struct sco_stream_out *)stream;
+
+    if(out->cfg.samplerate > 0)
+        return out->cfg.samplerate;
+    else
+        return SCO_SAMPLE_RATE_16K;
+}
+
+static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+{
+    UNUSED(stream);
+    DEBUG("rate = %d return 0",rate);
+    return 0;
+}
+
+static size_t out_get_buffer_size(const struct audio_stream *stream)
+{
+    DEBUG("return %d",SCO_OUT_BUFSIZE);
+    UNUSED(stream);
+
+    return SCO_OUT_BUFSIZE;
+}
+
+static audio_channel_mask_t out_get_channels(const struct audio_stream *stream)
+{
+    struct sco_stream_out *out = (struct sco_stream_out *)stream;
+    //DEBUG("%s", __func__);
+    if(out->cfg.channel_flags)
+        return out->cfg.channel_flags;
+    else
+        return SCO_STREAM_DEFAULT_CHANNEL_FLAG;
+}
+
+static audio_format_t out_get_format(const struct audio_stream *stream)
+{
+    struct sco_stream_out *out = (struct sco_stream_out *)stream;
+    //DEBUG("%s, out->cfg.format = %d", __func__, out->cfg.format);
+    if(out->cfg.format)
+        return out->cfg.format;
+    else
+        return SCO_STREAM_DEFAULT_FORMAT;
+}
+
+static int out_set_format(struct audio_stream *stream, audio_format_t format)
+{
+    UNUSED(stream);
+    //struct sco_stream_out *out = (struct sco_stream_out *)stream;
+
+    DEBUG("format=%08x return ENOSYS", format);
+    return -ENOSYS;
+}
+
+static int out_standby(struct audio_stream *stream)
+{
+    struct sco_stream_out * out = (struct sco_stream_out *)stream;
+    memset(&(out->base), 0,sizeof(out->base));
+    FNLOG();
+    out->last_frame_us = 0;
+
+    return 0;
+}
+
+static int out_dump(const struct audio_stream *stream, int fd)
+{
+    UNUSED(stream);
+    //struct sco_stream_out *out = (struct sco_stream_out *)stream;
+
+    DEBUG("fd=%d return 0",fd);
+    return 0;
+}
+
+static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+{
+    UNUSED(stream);
+    if(kvpairs)
+        DEBUG("%s return 0",kvpairs);
+    else
+        DEBUG("return 0");
+    return 0;
+}
+
+static char * out_get_parameters(const struct audio_stream *stream, const char *keys)
+{
+    UNUSED(stream);
+    if(keys)
+        DEBUG("%s",keys);
+
+    //UNUSED(keys);
+    //struct sco_stream_out *out = (struct sco_stream_out *)stream;
+
+    /* add populating param here */
+    return strdup("");
+}
+
+static uint32_t out_get_latency(const struct audio_stream_out *stream)
+{
+    UNUSED(stream);
+    //DEBUG("return 100");
+
+    return 100;
+}
+
+static int out_set_volume(struct audio_stream_out *stream, float left,
+        float right)
+{
+    DEBUG("left=%f right=%f ",left,right);
+    UNUSED(stream);
+    //UNUSED(left);
+    //UNUSED(right);
+
+    return 0;
+}
+
+static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
+                         size_t bytes)
+{
+    struct sco_stream_out *out = (struct sco_stream_out *)stream;
+    struct sco_audio_device *sco_dev = out->dev;
+    char cmd = 0;
+    uint64_t now_us;
+    struct timeval tv_write;
+    int res;
+    size_t in_frames = bytes / 4;
+    size_t out_frames = bytes / 8;
+    DEBUG("out_write, bytes=%d, out_fd = %d, device fd: %d", bytes, out->outfd, sco_dev->datafd);
+    pthread_mutex_lock(&out->lock);
+    DEBUG("samplerate = %d", out->cfg.samplerate);
+
+    int frames = bytes / audio_stream_out_frame_size(stream);
+    tv_write.tv_sec = frames / out_get_cached_sample_rate(&stream->common);
+    tv_write.tv_usec = (frames * 1000000 / out_get_cached_sample_rate(&stream->common)) % 1000000;
+
+    uint32_t write_frames_us = tv_write.tv_sec *1000000 + tv_write.tv_usec;
+
+    if(out->last_frame_us == 0) {
+        now_us = time_now_us();
+        out->last_frame_us = now_us;
+    }
+
+    //pcm is 16k stereo in sco audio policy config
+    uint16_t *pcm = (uint16_t *)malloc(bytes/2);
+    if (pcm) {
+        // Convert 16k stereo PCM to mono PCM
+        res = adjust_channels(buffer, 2, (void*)pcm, 1, 2, bytes);
+    } else {
+        ERROR("allocate mem for pcm channel convertion failed");
+        return (ssize_t)bytes;
+    }
+
+    //gettimeofday(&tv_before, NULL);
+    if((out->outfd <= 0) && (sco_dev->datafd > 0)) {
+        out->outfd = sco_dev->datafd;
+        if(sco_dev->ctrlfd > 0) {
+            DEBUG("start send sco data");
+            cmd = SCO_CTRL_CMD_OUT_START;
+            AUDIO_NO_INTR(res = send(sco_dev->ctrlfd, &cmd, 1, MSG_NOSIGNAL));
+        }
+    }
+
+    if(!sco_dev->wbs) {
+        uint16_t *pcm_8k = (uint16_t *)malloc(bytes/4);
+        if (pcm_8k) {
+            // Convert 16k PCM to 8k PCM
+            out->resampler->resample_from_input(out->resampler,
+                                              (int16_t *)pcm,
+                                              &in_frames,
+                                              (int16_t *)pcm_8k,
+                                              &out_frames);
+            if(out->outfd > 0) {
+                int len;
+                len = send(out->outfd, (uint8_t *)pcm_8k, (out_frames * 2), MSG_NOSIGNAL);
+                if(len < 0)
+                    ERROR("send pcm error");
+            }
+#ifdef STREAM_DUMP_DEBUG
+            if (debug_playback_fd == 0)
+                debug_pcm_data_open(&debug_playback_fd, true);
+
+            if(debug_playback_fd != 0)
+                debug_pcm_data_write(debug_playback_fd, (uint8_t *)pcm_8k, (out_frames * 2));
+#endif
+            free(pcm_8k);
+        }else {
+            ERROR("allocate mem for pcm sampler convertion failed");
+            pthread_mutex_unlock(&out->lock);
+            return (ssize_t)bytes;
+        }
+    }
+    else {
+        if(out->outfd > 0) {
+            int len = send(out->outfd, (uint8_t *)pcm, bytes/2, MSG_NOSIGNAL);
+            if(len < 0)
+                ERROR("send pcm error");
+        }
+    }
+
+    free(pcm);
+
+    now_us = time_now_us();
+    if((now_us - out->last_frame_us) < write_frames_us) {
+        usleep(write_frames_us - (now_us - out->last_frame_us));
+    }
+    out->last_frame_us = time_now_us();
+
+    pthread_mutex_unlock(&out->lock);
+
+    return (ssize_t)bytes;
+}
+
+static int out_get_render_position(const struct audio_stream_out *stream,
+                                   uint32_t *dsp_frames)
+{
+    UNUSED(stream);
+    UNUSED(dsp_frames);
+
+    FNLOG();
+
+    DEBUG("%s", __func__);
+    return -EINVAL;
+}
+
+static int out_add_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
+{
+    UNUSED(stream);
+    UNUSED(effect);
+
+    FNLOG();
+
+    return 0;
+}
+
+static int out_remove_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
+{
+    UNUSED(stream);
+    UNUSED(effect);
+
+    FNLOG();
+
+    return 0;
+}
+
+static int out_get_next_write_timestamp(const struct audio_stream_out *stream,
+                                        int64_t *timestamp)
+{
+    UNUSED(stream);
+    UNUSED(timestamp);
+
+//  DEBUG("return -EINVAL(%d)",-EINVAL);
+    return -EINVAL;
+}
+
+/** audio_stream_in implementation **/
+static uint32_t in_get_sample_rate(const struct audio_stream *stream)
+{
+    struct sco_stream_in * in = (struct sco_stream_in *)stream;
+
+    if(in->dev->wbs) {
+        if(in->cfg.samplerate != SCO_SAMPLE_RATE_16K)
+            ERROR("use wbs ,but sample rate is not 16k");
+        in->cfg.samplerate = SCO_SAMPLE_RATE_16K;
+    }
+    else {
+        if(in->cfg.samplerate != SCO_SAMPLE_RATE_8K)
+            ERROR("not use  wbs ,but sample rate is not 8k");
+        in->cfg.samplerate = SCO_SAMPLE_RATE_8K;
+    }
+
+    return in->cfg.samplerate;
+}
+
+static uint32_t in_get_cached_sample_rate(const struct audio_stream *stream)
+{
+    struct sco_stream_in * in = (struct sco_stream_in *)stream;
+
+    if(in->cfg.samplerate > 0)
+        return in->cfg.samplerate;
+    else
+        return SCO_STREAM_DEFAULT_RATE;
+}
+
+static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+
+    DEBUG("rate=%d return 0",rate);
+
+    if (in->cfg.samplerate > 0 && in->cfg.samplerate == rate)
+        return 0;
+    else
+        return -1;
+}
+
+static size_t in_get_buffer_size(const struct audio_stream *stream)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+
+    FNLOG();
+//  DEBUG("return 240");
+    if(in->dev->wbs) {
+        return SCO_IN_BUFSIZE;
+    }
+    else
+        return SCO_IN_BUFSIZE/2;
+}
+
+static audio_channel_mask_t in_get_channels(const struct audio_stream *stream)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+
+    FNLOG();
+    if(in->cfg.channel_flags)
+        return in->cfg.channel_flags;
+    else
+        return SCO_STREAM_DEFAULT_CHANNEL_FLAG;
+}
+
+static audio_format_t in_get_format(const struct audio_stream *stream)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+
+    //FNLOG();
+    if(in->cfg.format)
+        return in->cfg.format;
+    else
+        return SCO_STREAM_DEFAULT_FORMAT;
+}
+
+static int in_set_format(struct audio_stream *stream, audio_format_t format)
+{
+    UNUSED(stream);
+    //UNUSED(format);
+
+    DEBUG("format=%08x return 0", format);
+
+    if (format == AUDIO_FORMAT_PCM_16_BIT)
+        return 0;
+    else
+        return -1;
+}
+
+static int in_standby(struct audio_stream *stream)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+    memset(&(in->ts), 0,sizeof(in->ts));
+    memset(&(in->base), 0,sizeof(in->base));
+
+    in->last_frame_us = 0;
+    return 0;
+}
+
+static int in_dump(const struct audio_stream *stream, int fd)
+{
+    UNUSED(stream);
+    //UNUSED(fd);
+
+    DEBUG("fd=%d return 0",fd);
+    return 0;
+}
+
+static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
+{
+    UNUSED(stream);
+    //struct sco_stream_in *in = (struct sco_stream_in *)stream;
+    //struct sco_audio_device *adev = in->dev;
+
+    //struct str_parms *parms;
+    //char *str;
+    int ret = 0;
+    //bool do_standby = false;
+
+    DEBUG("in_set_parameters: %s", kvpairs);
+    /*
+       parms = str_parms_create_str(kvpairs);
+
+       ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_INPUT_SOURCE, value, sizeof(value));
+       if (ret >= 0) {
+       val = atoi(value);
+       if ((in->source != val) && (val != 0)) {
+       do_standby = true;
+       }
+       }
+
+       ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING, value, sizeof(value));
+       if (ret >= 0) {
+       val = atoi(value);
+       if ((in->source != val) && (val != 0)) {
+       do_standby = true;
+       }
+       }
+
+       in->standby = do_standby;
+
+       str_parms_destroy(parms);
+     */
+    return ret;
+}
+
+static char * in_get_parameters(const struct audio_stream *stream,
+                                const char *keys)
+{
+    UNUSED(stream);
+    //UNUSED(keys);
+
+    if(keys)
+        DEBUG("%s",keys);
+    else
+        DEBUG("");
+    return strdup("");
+}
+
+static int in_set_gain(struct audio_stream_in *stream, float gain)
+{
+    UNUSED(stream);
+    //UNUSED(gain);
+
+    DEBUG("gain=%f return 0",gain);
+    return 0;
+}
+
+static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
+                       size_t bytes)
+{
+    struct sco_stream_in *in = (struct sco_stream_in *)stream;
+    struct sco_audio_device *sco_dev = in->dev;
+    struct timeval tv_before, tv_after;
+    struct timeval tv_read;
+    struct timeval tv;
+    char cmd = 0;
+    size_t len = 0;
+    int i = 0;
+    int res;
+    uint64_t now_us;
+
+    int frames_num = bytes / audio_stream_in_frame_size(stream);
+    tv.tv_sec = frames_num / in_get_cached_sample_rate(&stream->common);
+    tv.tv_usec = (frames_num * 1000000 / in_get_cached_sample_rate(&stream->common)) % 1000000;
+
+    //uint32_t read_frames_us = tv.tv_sec *1000000 + tv.tv_usec;
+
+    if(in->last_frame_us == 0) {
+        now_us = time_now_us();
+        in->last_frame_us = now_us;
+    }
+    //capture in time before
+    gettimeofday(&tv_before, NULL);
+    DEBUG("in_read!, bytes = %d, infd : %d, datafd = %d", bytes, in->infd, sco_dev->datafd);
+    pthread_mutex_lock(&in->lock);
+    uint16_t *pcm;
+
+    if((in->infd <= 0) && (sco_dev->datafd > 0)) {
+        in->infd = sco_dev->datafd;
+        if(sco_dev->ctrlfd > 0) {
+            DEBUG("start sco data");
+            cmd = SCO_CTRL_CMD_IN_START;
+            AUDIO_NO_INTR(res = send(sco_dev->ctrlfd, &cmd, 1, MSG_NOSIGNAL));
+        }
+    }
+
+    if(sco_dev->wbs) {
+        pcm = (uint16_t *)malloc(bytes);
+        if(in->infd > 0) {
+            for(i = 0; i < 5; i++) {
+                AUDIO_NO_INTR(res = recv(in->infd, &((uint8_t *)buffer)[len], (bytes -len), MSG_NOSIGNAL));
+                if(res > 0)
+                    len += res;
+                if (res == -1)
+                    ERROR("read failed with errno=%s\n", strerror(errno));
+
+                if((size_t)len < bytes) {
+                    DEBUG("i = %d, read %d of %d bytes!", i, len, bytes);
+                }
+                if(len == bytes)
+                    break;
+                usleep(2000);
+            }
+
+            if ((len > 0) && ((size_t)len < bytes)) {
+                memset((int8_t *)buffer + len, 0, (bytes - len));
+                DEBUG("22222read %d of %d bytes!", len, bytes);
+            } else if (len == 0) {
+                memset((int8_t *)buffer, 0, bytes);
+                DEBUG("read %d of %d bytes failed, errno %s", len, bytes, strerror(errno));
+            }
+        }
+    }
+    else {
+        pcm = (uint16_t *)malloc(bytes/2);
+        if(in->infd > 0) {
+            for(i = 0; i < 5; i++) {
+                AUDIO_NO_INTR(res = recv(in->infd, &((uint8_t *)buffer)[len], (bytes -len), MSG_NOSIGNAL));
+                if(res > 0)
+                    len += res;
+                if (res == -1)
+                    ERROR("read failed with errno=%s\n", strerror(errno));
+
+                if((size_t)len < bytes) {
+                    DEBUG("i = %d, read %d of %d bytes!", i, len, bytes);
+                }
+                if(len == bytes)
+                    break;
+                usleep(2000);
+            }
+
+            if ((len > 0) && ((size_t)len < bytes)) {
+                memset((int8_t *)buffer + len, 0, (bytes - len));
+                DEBUG("22222read %d of %d bytes!", len, bytes);
+            } else if (len == 0) {
+                memset((int8_t *)buffer, 0, bytes);
+                DEBUG("read %d of %d bytes failed, errno %s", len, bytes, strerror(errno));
+            }
+        }
+
+#if 0
+        if(in->infd > 0) {
+            for(i = 0; i < 5; i++) {
+                AUDIO_NO_INTR(res = recv(in->infd, (uint8_t *)&pcm[len], (bytes/2 -len), MSG_NOSIGNAL));
+                if(res > 0)
+                    len += res;
+                if (res == -1)
+                    ERROR("read failed with errno=%s\n", strerror(errno));
+
+                if((size_t)len < bytes/2) {
+                    DEBUG("i = %d, read %d of %d bytes!", i, len, bytes/2);
+                }
+                if(len == bytes/2)
+                    break;
+                usleep(2000);
+            }
+
+            if ((len > 0) && ((size_t)len < bytes/2)) {
+                memset((int8_t *)pcm + len, 0, (bytes/2 - len));
+                DEBUG("22222read %d of %d bytes!", len, bytes/2);
+            } else if (len <= 0) {
+                memset((int8_t *)pcm, 0, bytes/2);
+                DEBUG("read %d of %d bytes failed, errno %s", len, bytes/2, strerror(errno));
+            }
+        }
+        size_t in_frames = bytes / 4;
+        size_t out_frames = bytes / 2;
+        // Convert 8k PCM to 16k PCM
+        in->resampler->resample_from_input(in->resampler,
+                                        (int16_t *)pcm,
+                                        &in_frames,
+                                        (int16_t *)buffer,
+                                        &out_frames);
+#endif
+    }
+#if 0
+    if (pcm) {
+        // Convert 16k mono PCM to stereo PCM
+        res = adjust_channels((void*)pcm, 1, buffer, 2, 2, (bytes/2));
+    } else {
+        DEBUG("allocate mem for pcm channel convertion failed");
+        return (ssize_t)bytes;
+    }
+#endif
+    free(pcm);
+
+#ifdef STREAM_DUMP_DEBUG
+    if (debug_record_fd == 0)
+        debug_pcm_data_open(&debug_record_fd, false);
+
+    if(debug_record_fd != 0)
+        debug_pcm_data_write(debug_record_fd, (uint8_t *)buffer, bytes);
+#endif
+
+    gettimeofday(&tv_after, NULL);
+    timersub(&tv_after, &tv_before, &tv_read);
+
+    if (timercmp(&tv, &tv_read, >=)) {
+        long usecs = (tv.tv_sec - tv_read.tv_sec) * 1000000 + (tv.tv_usec - tv_read.tv_usec);
+        usleep(usecs);
+        DEBUG("delayed sec %ld, usec %06ld", tv.tv_sec - tv_read.tv_sec,
+                tv.tv_usec - tv_read.tv_usec);
+    }
+/*
+    now_us = time_now_us();
+    if((now_us - in->last_frame_us) < read_frames_us) {
+        usleep(read_frames_us - (now_us - in->last_frame_us));
+    }
+    in->last_frame_us = time_now_us();
+*/
+    pthread_mutex_unlock(&in->lock);
+    return (ssize_t)bytes;
+}
+
+static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
+{
+    UNUSED(stream);
+
+    FNLOG();
+
+    return 0;
+}
+
+static int in_add_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
+{
+    UNUSED(stream);
+    UNUSED(effect);
+
+    FNLOG();
+
+    return 0;
+}
+
+static int in_remove_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
+{
+    UNUSED(stream);
+    UNUSED(effect);
+
+    FNLOG();
+
+    return 0;
+}
+
+static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
+{
+    UNUSED(dev);
+    //struct sco_audio_device *sco_dev = (struct sco_audio_device *)dev;
+    uint32_t devices = (AUDIO_DEVICE_OUT_ALL_SCO | AUDIO_DEVICE_IN_ALL_SCO);
+
+    DEBUG("return %08x", devices);
+    return devices;
+}
+
+static int adev_open_output_stream(struct audio_hw_device *dev,
+                                    audio_io_handle_t handle,
+                                    audio_devices_t devices,
+                                    audio_output_flags_t flags,
+                                    struct audio_config *config,
+                                    struct audio_stream_out **stream_out,
+                                    const char *address)
+{
+    struct sco_audio_device *sco_dev = (struct sco_audio_device *)dev;
+    struct sco_stream_out *out;
+    int ret = 0;
+
+    UNUSED(address);
+    UNUSED(handle);
+    UNUSED(devices);
+    UNUSED(flags);
+
+    DEBUG("handle:%d device:0x%08x sample_rate:%d,channel_mask:0x%08x,format:%d", handle, devices, config->sample_rate, config->channel_mask, config->format);
+
+    out = (struct sco_stream_out *)calloc(1, sizeof(struct sco_stream_out));
+
+    if (!out)
+        return -ENOMEM;
+
+#ifdef STREAM_DUMP_DEBUG
+    if (debug_playback_fd == 0)
+        debug_pcm_data_open(&debug_playback_fd, true);
+#endif
+
+    out->stream.common.get_sample_rate = out_get_sample_rate;
+    out->stream.common.set_sample_rate = out_set_sample_rate;
+    out->stream.common.get_buffer_size = out_get_buffer_size;
+    out->stream.common.get_channels = out_get_channels;
+    out->stream.common.get_format = out_get_format;
+    out->stream.common.set_format = out_set_format;
+    out->stream.common.standby = out_standby;
+    out->stream.common.dump = out_dump;
+    out->stream.common.set_parameters = out_set_parameters;
+    out->stream.common.get_parameters = out_get_parameters;
+    out->stream.common.add_audio_effect = out_add_audio_effect;
+    out->stream.common.remove_audio_effect = out_remove_audio_effect;
+    out->stream.get_latency = out_get_latency;
+    out->stream.set_volume = out_set_volume;
+    out->stream.write = out_write;
+    out->stream.get_render_position = out_get_render_position;
+    out->stream.get_next_write_timestamp = out_get_next_write_timestamp;
+
+    out->dev = sco_dev;
+    out->cfg.samplerate = out_get_sample_rate((const struct audio_stream *)&out->stream);;
+    //out->cfg.channel_flags = AUDIO_CHANNEL_OUT_MONO;
+    out->cfg.channel_flags = AUDIO_CHANNEL_OUT_STEREO;
+    out->cfg.format = AUDIO_FORMAT_PCM_16_BIT;
+    out->outfd = SCO_SKT_DISCONNECTED;
+    out->last_frame_us = 0;
+    memset(&(out->base), 0,sizeof(out->base));
+
+    /* set output config values */
+    if (config)
+    {
+       config->format = out_get_format((const struct audio_stream *)&out->stream);
+       config->sample_rate = out_get_sample_rate((const struct audio_stream *)&out->stream);
+       config->channel_mask = out_get_channels((const struct audio_stream *)&out->stream);
+    }
+
+    *stream_out = &out->stream;
+    sco_dev->output = out;
+
+    pthread_mutex_init(&out->lock, NULL);
+
+    ret = create_resampler(SCO_SAMPLE_RATE_16K,
+                       SCO_SAMPLE_RATE_8K,
+                       1,
+                       RESAMPLER_QUALITY_DEFAULT,
+                       NULL,
+                       &out->resampler);
+
+#if 0
+    if(sco_dev->alsa_card > 0) {
+        struct pcm_config pcm_config_tones = {
+            .channels = 1,
+            .rate = 8000,
+            .period_size = 120,
+            .period_count = 2,
+            .format = PCM_FORMAT_S16_LE,
+            .start_threshold = 0,
+            .stop_threshold = 0,
+            .silence_threshold = 0,
+            //.avail_min = 0,
+        };
+
+        sco_dev->output->pcm_playback = pcm_open(sco_dev->alsa_card, 0, PCM_OUT, &pcm_config_tones);
+        if (!sco_dev->output->pcm_playback || !pcm_is_ready(sco_dev->output->pcm_playback)) {
+            ERROR ("cannot open capture driver: %s", pcm_get_error(sco_dev->output->pcm_playback));
+            pcm_close(sco_dev->output->pcm_playback);
+        }
+    }
+#endif
+    return 0;
+
+}
+
+static void adev_close_output_stream(struct audio_hw_device *dev,
+                                     struct audio_stream_out *stream)
+{
+    struct sco_audio_device *sco_dev = (struct sco_audio_device *)dev;
+    struct sco_stream_out *out = (struct sco_stream_out *)stream;
+
+    pthread_mutex_lock(&sco_dev->lock);
+    if(out->outfd > 0)
+    {
+        out->outfd = SCO_SKT_DISCONNECTED;
+    }
+    pthread_mutex_unlock(&sco_dev->lock);
+
+    if (sco_dev->output->pcm_playback) {
+        pcm_close(sco_dev->output->pcm_playback);
+    }
+    free(stream);
+    sco_dev->output = NULL;
+#ifdef STREAM_DUMP_DEBUG
+    if (debug_playback_fd != 0) {
+        debug_pcm_data_close(&debug_playback_fd);
+        debug_playback_fd = 0;
+    }
+#endif
+    DEBUG("done");
+}
+
+static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
+{
+    struct sco_audio_device *sco_dev = (struct sco_audio_device *)dev;
+    struct sco_stream_out *out = sco_dev->output;
+    struct sco_stream_in *in = sco_dev->input;
+    int retval = 0;
+    struct str_parms *parms;
+    char value[32];
+    int i;
+
+    if (kvpairs)
+        DEBUG("%s",kvpairs);
+
+    if(strcmp(kvpairs, "") == 0) {
+        ALOGW("get set parameters");
+        return 0;
+    }
+    parms = str_parms_create_str(kvpairs);
+    retval = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_BT_SCO_WB, value, sizeof(value));
+    if(retval >= 0) {
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_ON) == 0) {
+            sco_dev->wbs = true;
+            DEBUG("wide band  speech is on, we use 16k 16bit pcm");
+            if(in)
+                in->cfg.samplerate = SCO_SAMPLE_RATE_16K;
+        }
+        else {
+            sco_dev->wbs = false;
+            DEBUG("narrow band speech, we use 8k 16bit pcm");
+            if(in)
+                in->cfg.samplerate = SCO_SAMPLE_RATE_8K;
+        }
+        return 0;
+    }
+
+    retval = str_parms_get_str(parms, "BT_SCO", value, sizeof(value));
+    if(retval >= 0) {
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_OFF) == 0) {
+            DEBUG("disconnect sco socket");
+            pthread_mutex_lock(&(sco_dev->lock));
+            if(sco_dev->ctrlfd > 0) {
+                DEBUG("stop sco data");
+                char cmd = SCO_CTRL_CMD_CLOSE;
+                int res;
+                AUDIO_NO_INTR(res = send(sco_dev->ctrlfd, &cmd, 1, MSG_NOSIGNAL));
+            }
+            if(sco_dev->datafd > 0) {
+                skt_disconnect(sco_dev->datafd);
+                sco_dev->datafd = SCO_SKT_DISCONNECTED;
+            }
+            if(sco_dev->ctrlfd > 0) {
+                skt_disconnect(sco_dev->ctrlfd);
+                sco_dev->ctrlfd = SCO_SKT_DISCONNECTED;
+            }
+            if(out) {
+                out->outfd = SCO_SKT_DISCONNECTED;
+            }
+            if(in) {
+                in->infd = SCO_SKT_DISCONNECTED;
+            }
+
+            pthread_mutex_unlock(&(sco_dev->lock));
+        }
+        else {
+          pthread_mutex_lock(&(sco_dev->lock));
+          if(sco_dev->datafd <= 0) {
+              for(i = 0; i < 5; i++) {
+                  sco_dev->datafd = skt_connect(SCO_DATA_PATH, SNDBUFSIZE, RCVBUFSIZE, 0, 0);
+                  if(sco_dev->datafd > 0) {
+                      break;
+                  }
+                  usleep(100000);
+              }
+          }
+          if(sco_dev->ctrlfd <= 0) {
+              for(i = 0; i < 5; i++) {
+              sco_dev->ctrlfd = skt_connect(SCO_CTRL_PATH, SNDBUFSIZE, RCVBUFSIZE, 0, 0);
+              if(sco_dev->ctrlfd > 0) {
+                  break;
+              }
+              usleep(100000);
+              }
+          }
+          pthread_mutex_unlock(&(sco_dev->lock));
+        }
+        return 0;
+    }
+/*
+    //todo future
+    if (out == NULL || in == NULL)
+        return retval;
+
+    if(out != NULL)
+        retval = out->stream.common.set_parameters((struct audio_stream *)out, kvpairs);
+
+    if(in != NULL)
+        retval = in->stream.common.set_parameters((struct audio_stream *)in, kvpairs);
+
+        return retval;
+*/
+
+    return -ENOSYS;
+}
+
+static char * adev_get_parameters(const struct audio_hw_device *dev,
+                                  const char *keys)
+{
+    struct str_parms *parms;
+    UNUSED(dev);
+
+    FNLOG();
+
+    if (keys)
+        DEBUG("%s", keys);
+
+    parms = str_parms_create_str(keys);
+
+    str_parms_dump(parms);
+
+    str_parms_destroy(parms);
+
+    return strdup("");
+}
+
+static int adev_init_check(const struct audio_hw_device *dev)
+{
+    UNUSED(dev);
+    //struct sco_audio_device *sco_dev = (struct sco_audio_device*)dev;
+
+    FNLOG();
+
+    return 0;
+}
+
+static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
+{
+    UNUSED(dev);
+    //UNUSED(volume);
+
+    DEBUG("volume=%f return -ENOSYS", volume);
+
+    return -ENOSYS;
+}
+
+static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
+{
+    UNUSED(dev);
+    //UNUSED(volume);
+
+    DEBUG("volume=%f return -ENOSYS", volume);
+
+    return -ENOSYS;
+}
+
+static int adev_get_master_volume(struct audio_hw_device *dev, float *volume)
+{
+    UNUSED(dev);
+    UNUSED(volume);
+
+    DEBUG("return -ENOSYS");
+
+    return -ENOSYS;
+}
+
+static int adev_set_master_mute(struct audio_hw_device *dev, bool muted)
+{
+    UNUSED(dev);
+    UNUSED(muted);
+
+    DEBUG("return -ENOSYS");
+
+    return -ENOSYS;
+}
+
+static int adev_get_master_mute(struct audio_hw_device *dev, bool *muted)
+{
+    UNUSED(dev);
+    UNUSED(muted);
+
+    DEBUG("return -ENOSYS");
+
+    return -ENOSYS;
+}
+
+static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
+{
+    UNUSED(dev);
+    //UNUSED(mode);
+
+    DEBUG("mode=%d return 0",mode);
+
+    return 0;
+}
+
+static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
+{
+    UNUSED(dev);
+    //UNUSED(state);
+
+    DEBUG("state=%d return -ENOSYS",state);
+
+    return -ENOSYS;
+}
+
+static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
+{
+    UNUSED(dev);
+    UNUSED(state);
+
+    DEBUG("return -ENOSYS");
+
+    return -ENOSYS;
+}
+
+static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
+                                         const struct audio_config *config)
+{
+    UNUSED(dev);
+    UNUSED(config);
+
+    DEBUG(" %s, return 320", __func__);
+    return 320;
+}
+
+static int adev_open_input_stream(struct audio_hw_device *dev,
+                            audio_io_handle_t handle,
+                            audio_devices_t devices,
+                            struct audio_config *config,
+                            struct audio_stream_in **stream_in,
+                            audio_input_flags_t flags,
+                            const char *address,
+                            audio_source_t source)
+{
+    struct sco_audio_device *sco_dev = (struct sco_audio_device *)dev;
+    struct sco_stream_in *in;
+    int ret;
+    UNUSED(address);
+    UNUSED(config);
+    UNUSED(devices);
+    UNUSED(flags);
+    UNUSED(handle);
+    UNUSED(source);
+
+    DEBUG("handle:%d device:%08x sample_rate:%d,channel_mask:%08x,format:%d", handle, devices, config->sample_rate, config->channel_mask, config->format);
+    DEBUG("audio source : %d", source);
+
+#ifdef STREAM_DUMP_DEBUG
+    if (debug_record_fd == 0)
+        debug_pcm_data_open(&debug_record_fd, false);
+#endif
+
+    in = (struct sco_stream_in *)calloc(1, sizeof(struct sco_stream_in));
+
+    if (!in)
+        return -ENOMEM;
+
+    in->dev = sco_dev;
+    in->stream.common.get_sample_rate = in_get_sample_rate;
+    in->stream.common.set_sample_rate = in_set_sample_rate;
+    in->stream.common.get_buffer_size = in_get_buffer_size;
+    in->stream.common.get_channels = in_get_channels;
+    in->stream.common.get_format = in_get_format;
+    in->stream.common.set_format = in_set_format;
+    in->stream.common.standby = in_standby;
+    in->stream.common.dump = in_dump;
+    in->stream.common.set_parameters = in_set_parameters;
+    in->stream.common.get_parameters = in_get_parameters;
+    in->stream.common.add_audio_effect = in_add_audio_effect;
+    in->stream.common.remove_audio_effect = in_remove_audio_effect;
+    in->stream.set_gain = in_set_gain;
+    in->stream.read = in_read;
+    in->stream.get_input_frames_lost = in_get_input_frames_lost;
+
+    in->infd = SCO_SKT_DISCONNECTED;
+    in->cfg.samplerate = in_get_sample_rate((struct audio_stream *) &in->stream);;
+    in->cfg.format = AUDIO_FORMAT_PCM_16_BIT;
+    in->cfg.channel_flags = AUDIO_CHANNEL_IN_MONO;
+    //in->cfg.channel_flags = AUDIO_CHANNEL_IN_STEREO;
+    in->last_frame_us = 0;
+    memset(&(in->base), 0,sizeof(in->base));
+    memset(&(in->ts), 0,sizeof(in->ts));
+
+    sco_dev->input = in;
+    *stream_in = &in->stream;
+
+    pthread_mutex_init(&in->lock, NULL);
+
+    ret = create_resampler(SCO_SAMPLE_RATE_8K,
+                       SCO_SAMPLE_RATE_16K,
+                       1,
+                       RESAMPLER_QUALITY_DEFAULT,
+                       NULL,
+                       &in->resampler);
+#if 0
+    if(sco_dev->alsa_card > 0) {
+        struct pcm_config pcm_config_tones = {
+            .channels = 1,
+            .rate = 8000,
+            .period_size = 120,
+            .period_count = 2,
+            .format = PCM_FORMAT_S16_LE,
+            .start_threshold = 0,
+            .stop_threshold = 0,
+            .silence_threshold = 0,
+            //.avail_min = 0,
+        };
+
+        sco_dev->input->pcm_capture = pcm_open(sco_dev->alsa_card, 0, PCM_IN, &pcm_config_tones);
+        if (!sco_dev->input->pcm_capture || !pcm_is_ready(sco_dev->input->pcm_capture)) {
+            ERROR ("cannot open capture driver: %s \n", pcm_get_error(sco_dev->input->pcm_capture));
+            pcm_close(sco_dev->input->pcm_capture);
+        }
+    }
+#endif
+    return 0;
+}
+
+static void adev_close_input_stream(struct audio_hw_device *dev,
+                                struct audio_stream_in *stream)
+{
+    struct sco_audio_device *sco_dev = (struct sco_audio_device *) dev;
+    struct sco_stream_in *in = (struct sco_stream_in *) stream;
+
+    pthread_mutex_lock(&sco_dev->lock);
+    if(in->infd > 0)
+    {
+        in->infd = SCO_SKT_DISCONNECTED;
+    }
+
+    pthread_mutex_unlock(&sco_dev->lock);
+    FNLOG();
+
+    if (sco_dev->input->pcm_capture) {
+        pcm_close(sco_dev->input->pcm_capture);
+    }
+    free(stream);
+    sco_dev->input = NULL;
+
+#ifdef STREAM_DUMP_DEBUG
+    if (debug_record_fd != 0)
+        debug_pcm_data_close(&debug_record_fd);
+#endif
+
+    return;
+}
+
+static int adev_dump(const audio_hw_device_t *device, int fd)
+{
+    UNUSED(device);
+    UNUSED(fd);
+
+    FNLOG();
+    return 0;
+}
+
+static int adev_close(hw_device_t *device)
+{
+    FNLOG();
+
+    free(device);
+    return 0;
+}
+
+static int adev_open(const hw_module_t* module, const char* name,
+                    hw_device_t** device)
+{
+    struct sco_audio_device *adev;
+    pthread_mutexattr_t lock_attr;
+    //int ret;
+
+    FNLOG();
+    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0) {
+        ERROR("interface %s not matching [%s]", name, AUDIO_HARDWARE_INTERFACE);
+        return -EINVAL;
+    }
+
+    adev = calloc(1, sizeof(struct sco_audio_device));
+
+    if (!adev)
+        return -ENOMEM;
+
+    adev->device.common.tag = HARDWARE_DEVICE_TAG;
+    adev->device.common.version = AUDIO_DEVICE_API_VERSION_2_0;
+    adev->device.common.module = (struct hw_module_t *) module;
+    adev->device.common.close = adev_close;
+
+    adev->device.get_supported_devices 	= adev_get_supported_devices;
+    adev->device.init_check = adev_init_check;
+    adev->device.set_voice_volume = adev_set_voice_volume;
+    adev->device.set_master_volume = adev_set_master_volume;
+    adev->device.get_master_volume = adev_get_master_volume;
+    adev->device.set_master_mute = adev_set_master_mute;
+    adev->device.get_master_mute = adev_get_master_mute;
+    adev->device.set_mode = adev_set_mode;
+    adev->device.set_mic_mute = adev_set_mic_mute;
+    adev->device.get_mic_mute = adev_get_mic_mute;
+    adev->device.set_parameters = adev_set_parameters;
+    adev->device.get_parameters = adev_get_parameters;
+    adev->device.get_input_buffer_size = adev_get_input_buffer_size;
+    adev->device.open_output_stream = adev_open_output_stream;
+    adev->device.close_output_stream = adev_close_output_stream;
+    adev->device.open_input_stream = adev_open_input_stream;
+    adev->device.close_input_stream = adev_close_input_stream;
+    adev->device.dump = adev_dump;
+
+    adev->ctrlfd = SCO_SKT_DISCONNECTED;
+    adev->datafd = SCO_SKT_DISCONNECTED;
+    adev->output = NULL;
+    adev->alsa_card = -1;
+
+    pthread_mutexattr_init(&lock_attr);
+    pthread_mutexattr_settype(&lock_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&adev->lock, &lock_attr);
+
+    *device = &adev->device.common;
+
+#if 0
+    detect_alsa_card_number(adev);
+#endif
+
+    return 0;
+}
+
+static struct hw_module_methods_t sco_hal_module_methods = {
+    .open = adev_open,
+};
+
+struct audio_module HAL_MODULE_INFO_SYM = {
+    .common = {
+        .tag = HARDWARE_MODULE_TAG,
+        .version_major = 1,
+        .version_minor = 0,
+        .id = AUDIO_HARDWARE_MODULE_ID,
+        .name = "SCO Audio HW HAL",
+        .author = "The Android Open Source Project",
+        .methods = &sco_hal_module_methods,
+    },
+};

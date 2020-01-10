@@ -1,0 +1,36 @@
+#ifndef _RTK_UCTRL_H_
+#define _RTK_UCTRL_H_
+
+#include <sys/ioctl.h>
+
+#define RTK_UCTRL_IOCTL_MAGIC            0xEB
+#define RTK_UCTRL_IOCTL_NONE             _IO(RTK_UCTRL_IOCTL_MAGIC,  0x00)
+/* v1.0 */
+#define RTK_UCTRL_IOCTL_CLK_EN_TP_SET    _IO(RTK_UCTRL_IOCTL_MAGIC,  0x01)
+#define RTK_UCTRL_IOCTL_CLK_EN_TP_CLEAR  _IO(RTK_UCTRL_IOCTL_MAGIC,  0x02)
+#define RTK_UCTRL_IOCTL_CLK_EN_TP_STATE  _IOR(RTK_UCTRL_IOCTL_MAGIC, 0x03, unsigned int)
+#define RTK_UCTRL_IOCTL_RSTN_TP_SET      _IO(RTK_UCTRL_IOCTL_MAGIC,  0x04)
+#define RTK_UCTRL_IOCTL_RSTN_TP_CLEAR    _IO(RTK_UCTRL_IOCTL_MAGIC,  0x05)
+#define RTK_UCTRL_IOCTL_RSTN_TP_STATE    _IOR(RTK_UCTRL_IOCTL_MAGIC, 0x06, unsigned int)
+/* v1.1 */
+#define RTK_UCTRL_IOCTL_GET_VERSION      _IOR(RTK_UCTRL_IOCTL_MAGIC, 0x10, unsigned int)
+#define RTK_UCTRL_IOCTL_SET              _IOW(RTK_UCTRL_IOCTL_MAGIC, 0x11, unsigned int)
+#define RTK_UCTRL_IOCTL_CLEAR            _IOW(RTK_UCTRL_IOCTL_MAGIC, 0x12, unsigned int)
+#define RTK_UCTRL_IOCTL_STATE            _IOWR(RTK_UCTRL_IOCTL_MAGIC, 0x13, unsigned int)
+
+enum RTK_UCTRL_ITEM_ID {
+    RTK_UCTRL_CLK_EN_TP,
+    RTK_UCTRL_RSTN_TP,
+    RTK_UCTRL_CLK_EN_SE,
+    RTK_UCTRL_RSTN_SE,
+    RTK_UCTRL_CLK_EN_MD,
+    RTK_UCTRL_RSTN_MD,
+    RTK_UCTRL_LIST_END
+};
+
+#define __APPLY_VMASK(_v)    ((_v) & 0xffff)
+#define RTK_UCTRL_MAKE_VERSION(_maj, _min) ((__APPLY_VMASK(_min) << 16) | __APPLY_VMASK(_maj))
+#define RTK_UCTRL_GET_VERSION_MAJOR(_v)  __APPLY_VMASK(_v)
+#define RTK_UCTRL_GET_VERSION_MINOR(_v)  __APPLY_VMASK((_v) >> 16)
+
+#endif /* _RTK_UCTRL_H_ */

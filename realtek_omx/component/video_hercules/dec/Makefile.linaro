@@ -1,0 +1,205 @@
+PLATFORM_LIB_SRC_PATH=../../../../../..
+GENERIC_LINUX_PATH=$(PLATFORM_LIB_SRC_PATH)/genericLinux
+include $(GENERIC_LINUX_PATH)/MakeConfig
+
+MYDEFS=-DHAVE_SYS_UIO_H
+rm=/bin/rm -f
+cp=/bin/cp -f
+CC= $(MYCC)
+CXX = $(MYCXX)
+AR= $(MYAR) cq
+RANLIB= $(MYRANLIB)
+
+MODULE_NAME:=libOMX.realtek.video.dec
+LOCAL_MODULE1=$(MODULE_NAME)
+LOCAL_MODULE2=$(MODULE_NAME).ve2
+LOCAL_MODULE3=$(MODULE_NAME).dovi
+LIBNAME1=$(GENERIC_LINUX_PATH)/lib/$(LOCAL_MODULE1).so
+LIBNAME2=$(GENERIC_LINUX_PATH)/lib/$(LOCAL_MODULE2).so
+LIBNAME3=$(GENERIC_LINUX_PATH)/lib/$(LOCAL_MODULE3).so
+
+TOP=$(PLATFORM_LIB_SRC_PATH)
+
+RTK_TOP := $(TOP)/hardware/realtek/realtek_omx
+RTK_INC := $(RTK_TOP)/include
+RTK_RPC := $(TOP)/device/realtek/proprietary/libs/rtk_libs/common
+RTK_VE1:= $(TOP)/hardware/realtek/VideoEngine2/hercules/VE
+#RTK_VE3:= $(TOP)/hardware/realtek/VideoEngine/VE3
+RTK_JPG:= $(TOP)/hardware/realtek/VideoEngine2/hercules/JPEG
+
+OMX_DECODER_TUNNELING_SUPPORT = false
+
+
+LOCAL_SRC_FILES1 := \
+    decoder.c \
+    codec.c \
+    codec_ve1.c \
+    codec_video_common.c \
+    codec_jdec.c \
+    codec_HEVCHdrParameterParser.c \
+    vo_writeback/codec_VORPC.c \
+    base/vport.c \
+    base/vbuffer.c \
+    utils/Feature.c \
+    utils/env.c \
+    utils/BWControl.cpp \
+    utils/PWControl.cpp \
+    utils/SecureHandle.c \
+    utils/list.c
+
+LOCAL_SRC_FILES2 := \
+    decoder.c \
+    codec.c \
+    codec_ve2.c \
+    codec_video_common.c \
+    codec_HEVCHdrParameterParser.c \
+    vo_writeback/codec_VORPC.c \
+    codec_vpxparser.c \
+    base/vport.c \
+    base/vbuffer.c \
+    utils/Feature.c \
+    utils/env.c \
+    utils/BWControl.cpp \
+    utils/PWControl.cpp \
+    utils/SecureHandle.c \
+    utils/list.c
+
+
+LOCAL_C_INCLUDES := \
+    . \
+    $(RTK_INC)/rtkext \
+    $(RTK_INC)/imagination \
+    $(TOP)/system/core/include \
+    $(TOP)/system/core/include/cutils \
+    $(TOP)/bionic/libc/kernel/common \
+    $(TOP)/hardware/libhardware/include \
+    $(RTK_TOP)/osal_rtk \
+    $(RTK_TOP)/core \
+    $(RTK_VE1)/vpuapi \
+    $(RTK_VE1)/sample/helper \
+    $(RTK_JPG)/include \
+    $(RTK_JPG)/jpuapi \
+    $(RTK_JPG) \
+    $(TOP)/hardware/realtek/StreamingEngine2 \
+    $(GENERIC_LINUX_PATH)/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/common/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/common/IPC/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/common/IPC/generate/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/common/IPC/generate/include/system \
+    $(TOP)/device/realtek/proprietary/libs/rtk_libs/OSAL/include \
+    $(TOP)/device/realtek/proprietary/libs/libRTKAllocator/include \
+    $(TOP)/device/realtek/proprietary/libs/rtk_ion \
+    $(TOP)/device/realtek/proprietary/libs/Include
+
+INCLUDES = $(addprefix -I, $(LOCAL_C_INCLUDES))
+
+
+
+OBJ_FILES1 = $(addsuffix .ve1o, $(basename $(LOCAL_SRC_FILES1)))
+OBJ_FILES2 = $(addsuffix .ve2o, $(basename $(LOCAL_SRC_FILES2)))
+
+
+LOCAL_SHARED_LIBRARIES = \
+    -Wl,--whole-archive \
+    $(GENERIC_LINUX_PATH)/src/libMisc/generic_misc.o \
+    $(GENERIC_LINUX_PATH)/lib/libhwse_$(TARGET_BOARD_PLATFORM).a \
+    $(GENERIC_LINUX_PATH)/lib/libRtkIpc.a \
+    $(GENERIC_LINUX_PATH)/lib/libRTKAllocator.a \
+    $(GENERIC_LINUX_PATH)/lib/libcutils.a \
+    $(GENERIC_LINUX_PATH)/lib/librtk_ion.a \
+    -Wl,--no-whole-archive
+
+
+LOCAL_CFLAGS = -DOMX_DECODER_VIDEO_DOMAIN -DUSE_OUTPUT_CROP
+LOCAL_CFLAGS += -DUSE_RT_ION
+
+ifeq ($(OMX_DECODER_TUNNELING_SUPPORT), true)
+LOCAL_SRC_FILES1 += sidebandOutput.c Sideband_C.cpp
+LOCAL_SRC_FILES2 += sidebandOutput.c Sideband_C.cpp
+LOCAL_CFLAGS += -DOMX_DECODER_TUNNELING_SUPPORT
+endif
+
+ifeq ($(ENABLE_TEE_DRM_FLOW),true)
+LOCAL_CFLAGS += -DENABLE_TEE_DRM_FLOW
+LOCAL_C_INCLUDES += $(TOP)/device/realtek/proprietary/libs/Include/TEEapi
+LIBS += -L$(GENERIC_LINUX_PATH)/lib -lTEEapi
+else
+LOCAL_CFLAGS += -DDISABLE_SECURE_PATH
+endif
+
+
+CFLAGS = $(INCLUDES) $(DEFINES) $(LOCAL_CFLAGS) -DSYS_UNIX=1 $(MYDEFS) -fPIC
+
+VE1_CFLAGS = -DOMX_DECODER_VE1
+VE2_CFLAGS = -DOMX_DECODER_VE2
+
+# create symbolic links to each decoders
+DECODER_FORMATS_VE1 = avc
+DECODER_FORMATS_VE1 += mpeg4
+DECODER_FORMATS_VE1 += vp8
+DECODER_FORMATS_VE1 += 3gpp
+DECODER_FORMATS_VE1 += mpeg2
+DECODER_FORMATS_VE1 += raw
+DECODER_FORMATS_VE1 += vc1
+DECODER_FORMATS_VE1 += rv
+DECODER_FORMATS_VE1 += divx3
+DECODER_FORMATS_VE1 += avs
+DECODER_FORMATS_VE1 += mjpg
+DECODER_FORMATS_VE1 += wvc1
+DECODER_FORMATS_VE1 += wmv3
+DECODER_FORMATS_VE1 += wmv
+DECODER_FORMATS_VE1 += mp43
+DECODER_FORMATS_VE1 += flv
+DECODER_FORMATS_VE1 += rv30
+DECODER_FORMATS_VE1 += rv40
+SYMLINKS_VE1 = $(addsuffix .so,$(addprefix $(MODULE_NAME).,$(DECODER_FORMATS_VE1)))
+
+DECODER_FORMATS_VE2 = hevc
+DECODER_FORMATS_VE2 += vp9
+SYMLINKS_VE2 = $(addsuffix .so,$(addprefix $(MODULE_NAME).,$(DECODER_FORMATS_VE2)))
+
+
+
+all: $(LIBNAME1) $(LIBNAME2) link_libs
+
+link_libs:
+	cd $(GENERIC_LINUX_PATH)/lib/; $(foreach t,$(SYMLINKS_VE1),ln -sf $(LOCAL_MODULE1).so $(t);)
+	cd $(GENERIC_LINUX_PATH)/lib/; $(foreach t,$(SYMLINKS_VE2),ln -sf $(LOCAL_MODULE2).so $(t);)
+
+unlink_libs:
+	cd $(GENERIC_LINUX_PATH)/lib/; $(foreach t,$(SYMLINKS_VE1),rm -f $(LOCAL_MODULE1).so $(t);)
+	cd $(GENERIC_LINUX_PATH)/lib/; $(foreach t,$(SYMLINKS_VE2),rm -f $(LOCAL_MODULE2).so $(t);)
+
+$(LIBNAME1) : $(OBJ_FILES1)
+	$(SHOW_COMMAND)$(rm) $@
+	$(SHOW_COMMAND)$(AR) $@ $(OBJ_FILES1)
+	$(CC) -shared $(LOCAL_SHARED_LIBRARIES) -o $@ $(OBJ_FILES1) $(LIBS)
+
+$(LIBNAME2) : $(OBJ_FILES2)
+	$(SHOW_COMMAND)$(rm) $@
+	$(SHOW_COMMAND)$(AR) $@ $(OBJ_FILES2)
+	$(CC) -shared $(LOCAL_SHARED_LIBRARIES) -o $@ $(OBJ_FILES2) $(LIBS)
+
+clean: unlink_libs
+	$(SHOW_COMMAND)$(rm) $(OBJ_FILES1) $(OBJ_FILES2) $(LIBNAME1) $(LIBNAME2) core *~
+
+miniclean: clean
+%.ve2o:%.cpp
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo -=--=--=- [$*.cpp] -=--=--=--=--=--=--=--=--=-
+	$(SHOW_COMMAND)$(CXX) $(CFLAGS) $(VE2_CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.cpp -o $@
+
+%.ve2o:%.c
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo --------- [$*.c] ---------------------------
+	$(SHOW_COMMAND)$(CC) $(CFLAGS) $(VE2_CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.c -o $@
+
+%.ve1o:%.cpp
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo -=--=--=- [$*.cpp] -=--=--=--=--=--=--=--=--=-
+	$(SHOW_COMMAND)$(CXX) $(CFLAGS) $(VE1_CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.cpp -o $@
+
+%.ve1o:%.c
+	$(rm) -f $@
+	$(SHOW_COMMAND)echo --------- [$*.c] ---------------------------
+	$(SHOW_COMMAND)$(CC) $(CFLAGS) $(VE1_CFLAGS) $(WARNING) $(DEBUGFLAG) $(LIBS) -c $*.c -o $@
